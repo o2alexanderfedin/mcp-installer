@@ -227,23 +227,6 @@ async function installRepoWithArgs(
   }
 }
 
-// Keep the old function for compatibility
-function installRepoWithArgsToClaudeDesktop(
-  name: string,
-  npmIfTrueElseUvx: boolean,
-  args?: string[],
-  env?: string[]
-) {
-  // If the name is in a scoped package, we need to remove the scope
-  const serverName = /^@.*\//i.test(name) ? name.split("/")[1] : name;
-
-  installToClaudeDesktop(
-    serverName,
-    npmIfTrueElseUvx ? "npx" : "uvx",
-    [name, ...(args ?? [])],
-    env
-  );
-}
 
 async function attemptNodeInstall(
   directory: string
