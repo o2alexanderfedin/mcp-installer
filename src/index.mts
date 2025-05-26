@@ -11,6 +11,117 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawnPromise } from "spawn-rx";
 
+// Strategy Pattern for installation methods
+interface InstallationStrategy {
+  install(name: string, cmd: string, args: string[], env?: string[]): Promise<void>;
+  getMethodName(): string;
+  getSuccessMessage(): string;
+}
+
+class ClaudeCliStrategy implements InstallationStrategy {
+  async install(name: string, cmd: string, args: string[], env?: string[]): Promise<void> {
+    // First, try to remove any existing server with the same name
+    try {
+      await spawnPromise("claude", ["mcp", "remove", name], { stdio: "ignore" });
+    } catch (e) {
+      // Ignore errors - server might not exist
+    }
+
+    // Build the claude mcp add command
+    const claudeArgs = ["mcp", "add", name, cmd];
+    
+    // Add arguments if provided
+    if (args && args.length > 0) {
+      claudeArgs.push("--args");
+      claudeArgs.push(...args);
+    }
+
+    // Add environment variables if provided
+    if (env && env.length > 0) {
+      for (const envVar of env) {
+        claudeArgs.push("--env");
+        claudeArgs.push(envVar);
+      }
+    }
+
+    // Execute the claude mcp add command
+    await spawnPromise("claude", claudeArgs);
+  }
+
+  getMethodName(): string {
+    return "Claude CLI";
+  }
+
+  getSuccessMessage(): string {
+    return "Server is now available!";
+  }
+}
+
+class ClaudeDesktopStrategy implements InstallationStrategy {
+  async install(name: string, cmd: string, args: string[], env?: string[]): Promise<void> {
+    const configPath =
+      process.platform === "win32"
+        ? path.join(
+            os.homedir(),
+            "AppData",
+            "Roaming",
+            "Claude",
+            "claude_desktop_config.json"
+          )
+        : path.join(
+            os.homedir(),
+            "Library",
+            "Application Support",
+            "Claude",
+            "claude_desktop_config.json"
+          );
+
+    let config: any;
+    try {
+      config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    } catch (e) {
+      config = {};
+    }
+
+    const envObj = (env ?? []).reduce((acc, val) => {
+      const [key, value] = val.split("=");
+      acc[key] = value;
+
+      return acc;
+    }, {} as Record<string, string>);
+
+    const newServer = {
+      command: cmd,
+      args: args,
+      ...(env ? { env: envObj } : {}),
+    };
+
+    const mcpServers = config.mcpServers ?? {};
+    mcpServers[name] = newServer;
+    config.mcpServers = mcpServers;
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  }
+
+  getMethodName(): string {
+    return "Claude Desktop config";
+  }
+
+  getSuccessMessage(): string {
+    return "Tell the user to restart the app";
+  }
+}
+
+// Strategy detection and selection
+async function detectInstallationStrategy(): Promise<InstallationStrategy> {
+  if (await hasClaudeCLI()) {
+    return new ClaudeCliStrategy();
+  }
+  return new ClaudeDesktopStrategy();
+}
+
+// Global strategy instance - initialized at startup
+let installationStrategy: InstallationStrategy;
+
 const server = new Server(
   {
     name: "mcp-installer",
@@ -116,89 +227,6 @@ async function isNpmPackage(name: string) {
   }
 }
 
-async function installToClaudeCLI(
-  name: string,
-  cmd: string,
-  args: string[],
-  env?: string[]
-) {
-  // First, try to remove any existing server with the same name
-  try {
-    await spawnPromise("claude", ["mcp", "remove", name], { stdio: "ignore" });
-  } catch (e) {
-    // Ignore errors - server might not exist
-  }
-
-  // Build the claude mcp add command
-  const claudeArgs = ["mcp", "add", name, cmd];
-  
-  // Add arguments if provided
-  if (args && args.length > 0) {
-    claudeArgs.push("--args");
-    claudeArgs.push(...args);
-  }
-
-  // Add environment variables if provided
-  if (env && env.length > 0) {
-    for (const envVar of env) {
-      claudeArgs.push("--env");
-      claudeArgs.push(envVar);
-    }
-  }
-
-  // Execute the claude mcp add command
-  await spawnPromise("claude", claudeArgs);
-}
-
-// Keep the old function for fallback compatibility
-function installToClaudeDesktop(
-  name: string,
-  cmd: string,
-  args: string[],
-  env?: string[]
-) {
-  const configPath =
-    process.platform === "win32"
-      ? path.join(
-          os.homedir(),
-          "AppData",
-          "Roaming",
-          "Claude",
-          "claude_desktop_config.json"
-        )
-      : path.join(
-          os.homedir(),
-          "Library",
-          "Application Support",
-          "Claude",
-          "claude_desktop_config.json"
-        );
-
-  let config: any;
-  try {
-    config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  } catch (e) {
-    config = {};
-  }
-
-  const envObj = (env ?? []).reduce((acc, val) => {
-    const [key, value] = val.split("=");
-    acc[key] = value;
-
-    return acc;
-  }, {} as Record<string, string>);
-
-  const newServer = {
-    command: cmd,
-    args: args,
-    ...(env ? { env: envObj } : {}),
-  };
-
-  const mcpServers = config.mcpServers ?? {};
-  mcpServers[name] = newServer;
-  config.mcpServers = mcpServers;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-}
 
 async function installRepoWithArgs(
   name: string,
@@ -209,22 +237,13 @@ async function installRepoWithArgs(
   // If the name is in a scoped package, we need to remove the scope
   const serverName = /^@.*\//i.test(name) ? name.split("/")[1] : name;
 
-  // Try Claude CLI first, fallback to Claude Desktop
-  if (await hasClaudeCLI()) {
-    await installToClaudeCLI(
-      serverName,
-      npmIfTrueElseUvx ? "npx" : "uvx",
-      [name, ...(args ?? [])],
-      env
-    );
-  } else {
-    installToClaudeDesktop(
-      serverName,
-      npmIfTrueElseUvx ? "npx" : "uvx",
-      [name, ...(args ?? [])],
-      env
-    );
-  }
+  // Use the pre-selected strategy
+  await installationStrategy.install(
+    serverName,
+    npmIfTrueElseUvx ? "npx" : "uvx",
+    [name, ...(args ?? [])],
+    env
+  );
 }
 
 
@@ -272,35 +291,23 @@ async function installLocalMcpServer(
   if (fs.existsSync(path.join(dirPath, "package.json"))) {
     const servers = await attemptNodeInstall(dirPath);
 
-    // Try Claude CLI first, fallback to Claude Desktop
-    if (await hasClaudeCLI()) {
-      for (const [name, serverPath] of Object.entries(servers)) {
-        await installToClaudeCLI(
-          name,
-          "node",
-          [serverPath, ...(args ?? [])],
-          env
-        );
-      }
-    } else {
-      Object.keys(servers).forEach((name) => {
-        installToClaudeDesktop(
-          name,
-          "node",
-          [servers[name], ...(args ?? [])],
-          env
-        );
-      });
+    // Install all servers using the pre-selected strategy
+    for (const [name, serverPath] of Object.entries(servers)) {
+      await installationStrategy.install(
+        name,
+        "node",
+        [serverPath, ...(args ?? [])],
+        env
+      );
     }
 
-    const installMethod = (await hasClaudeCLI()) ? "Claude CLI" : "Claude Desktop config";
     return {
       content: [
         {
           type: "text",
-          text: `Installed the following servers via ${installMethod} successfully! ${Object.keys(
+          text: `Installed the following servers via ${installationStrategy.getMethodName()} successfully! ${Object.keys(
             servers
-          ).join(";")} ${(await hasClaudeCLI()) ? "Servers are now available!" : "Tell the user to restart the app"}`,
+          ).join(";")} ${installationStrategy.getSuccessMessage()}`,
         },
       ],
     };
@@ -334,10 +341,6 @@ async function installRepoMcpServer(
     };
   }
 
-  const useClaudeCLI = await hasClaudeCLI();
-  const installMethod = useClaudeCLI ? "Claude CLI" : "Claude Desktop config";
-  const restartMessage = useClaudeCLI ? "Server is now available!" : "Tell the user to restart the app";
-
   if (await isNpmPackage(name)) {
     await installRepoWithArgs(name, true, args, env);
 
@@ -345,7 +348,7 @@ async function installRepoMcpServer(
       content: [
         {
           type: "text",
-          text: `Installed MCP server via npx using ${installMethod} successfully! ${restartMessage}`,
+          text: `Installed MCP server via npx using ${installationStrategy.getMethodName()} successfully! ${installationStrategy.getSuccessMessage()}`,
         },
       ],
     };
@@ -369,7 +372,7 @@ async function installRepoMcpServer(
     content: [
       {
         type: "text",
-        text: `Installed MCP server via uvx using ${installMethod} successfully! ${restartMessage}`,
+        text: `Installed MCP server via uvx using ${installationStrategy.getMethodName()} successfully! ${installationStrategy.getSuccessMessage()}`,
       },
     ],
   };
@@ -412,6 +415,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
 });
 
 async function runServer() {
+  // Initialize installation strategy at startup
+  installationStrategy = await detectInstallationStrategy();
+  
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
